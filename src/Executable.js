@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import GrpcServiceError from "./grpc/GrpcServiceError.js";
-import GrpcStatus from "./grpc/GrpcStatus.js";
 import List from "./transaction/List.js";
-import * as hex from "./encoding/hex.js";
-import HttpError from "./http/HttpError.js";
-import Status from "./Status.js";
-import MaxAttemptsOrTimeoutError from "./MaxAttemptsOrTimeoutError.js";
+import RetryExecutor, { ExecutionState, RST_STREAM } from "./RetryExecutor.js";
+
+// Re-export for backward compatibility — consumers import these from Executable.js
+export { ExecutionState, RST_STREAM };
 
 /**
  * @typedef {import("./account/AccountId.js").default} AccountId
@@ -17,19 +15,9 @@ import MaxAttemptsOrTimeoutError from "./MaxAttemptsOrTimeoutError.js";
  * @typedef {import("./Node.js").default} Node
  * @typedef {import("./Signer.js").Signer} Signer
  * @typedef {import("./PublicKey.js").default} PublicKey
+ * @typedef {import("./Status.js").default} Status
  * @typedef {import("./logger/Logger.js").default} Logger
  */
-
-/**
- * @enum {string}
- */
-export const ExecutionState = {
-    Finished: "Finished",
-    Retry: "Retry",
-    Error: "Error",
-};
-
-export const RST_STREAM = /\brst[^0-9a-zA-Z]stream\b/i;
 
 /**
  * @abstract
@@ -279,7 +267,7 @@ export default class Executable {
      *
      * @abstract
      * @protected
-     * @param {import("./client/Client.js").default<Channel, *>} client
+     * @param {import("./client/Client.js").default<Channel, MirrorChannel>} client
      * @returns {Promise<void>}
      */
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -425,47 +413,6 @@ export default class Executable {
     }
 
     /**
-     * Determine if we should error based on the gRPC status
-     *
-     * Unlike `shouldRetry` this method does in fact still return a boolean
-     *
-     * @protected
-     * @param {Error} error
-     * @returns {boolean}
-     */
-    _shouldRetryExceptionally(error) {
-        if (error instanceof GrpcServiceError) {
-            return (
-                error.status._code === GrpcStatus.Timeout._code ||
-                error.status._code === GrpcStatus.DeadlineExceeded._code ||
-                error.status._code === GrpcStatus.Unavailable._code ||
-                error.status._code === GrpcStatus.ResourceExhausted._code ||
-                error.status._code === GrpcStatus.GrpcWeb._code ||
-                (error.status._code === GrpcStatus.Internal._code &&
-                    RST_STREAM.test(error.message))
-            );
-        } else {
-            // if we get to the 'else' statement, the 'error' is instanceof 'HttpError'
-            // and in this case, we have to retry always
-            return true;
-        }
-    }
-
-    /**
-     * @private
-     * @param {Error} error
-     * @param {number} attempt
-     * @returns {boolean}
-     */
-    _shouldRetryRequestError(error, attempt) {
-        return (
-            (error instanceof GrpcServiceError || error instanceof HttpError) &&
-            this._shouldRetryExceptionally(error) &&
-            attempt <= /** @type {number} */ (this._maxAttempts)
-        );
-    }
-
-    /**
      * A helper method for setting the operator on the request
      *
      * @internal
@@ -594,33 +541,6 @@ export default class Executable {
     }
 
     /**
-     * @private
-     * @template {Channel} ChannelT
-     * @template {MirrorChannel} MirrorChannelT
-     * @param {import("./client/Client.js").default<ChannelT, MirrorChannelT>} client
-     * @returns {Node}
-     */
-    _getExecutionNode(client) {
-        /** @type {Node} */
-        let currentNode;
-
-        if (this._nodeAccountIds.isEmpty) {
-            currentNode = client._network.getNode();
-            this._nodeAccountIds.setList([currentNode.accountId]);
-        } else {
-            currentNode = client._network.getNode(this._nodeAccountIds.current);
-        }
-
-        if (currentNode == null) {
-            throw new Error(
-                `NodeAccountId not recognized: ${this._nodeAccountIds.current.toString()}`,
-            );
-        }
-
-        return currentNode;
-    }
-
-    /**
      * This is used to skip the current node if the node account ID is not valid for the transaction.
      * @private
      * @param {AccountId} nodeAccountId
@@ -643,138 +563,6 @@ export default class Executable {
     }
 
     /**
-     * @private
-     * @param {Node} currentNode
-     * @param {RequestT} request
-     * @param {number} attempt
-     * @param {boolean} isLocalNode
-     * @returns {Promise<void>}
-     */
-    async _handleUnhealthyNode(currentNode, request, attempt, isLocalNode) {
-        // Check if the request is a transaction receipt or record request
-        // with a single node (traditional behavior), or if it's a local node.
-        // For single-node receipt queries, we retry the same node with backoff.
-        // For multi-node receipt queries (when failover is enabled), we allow
-        // advancing to the next node like other queries.
-        const isSingleNodeReceiptOrRecordRequest =
-            isTransactionReceiptOrRecordRequest(request) &&
-            this._nodeAccountIds.length <= 1;
-
-        if (isSingleNodeReceiptOrRecordRequest || isLocalNode) {
-            await delayForAttempt(
-                isLocalNode,
-                attempt,
-                /** @type {number} */ (this._minBackoff),
-                this._maxBackoff,
-            );
-            return;
-        }
-
-        const isLastNode =
-            this._nodeAccountIds.index === this._nodeAccountIds.list.length - 1;
-
-        if (isLastNode) {
-            throw new Error(
-                `Network connectivity issue: All nodes are unhealthy. Original node list: ${this._nodeAccountIds.list.join(
-                    ", ",
-                )}`,
-            );
-        }
-
-        this._logger?.debug(
-            `[${this._getLogId()}] Node is not healthy, trying the next node.`,
-        );
-        this._nodeAccountIds.advance();
-    }
-
-    /**
-     * @private
-     * @template {Channel} ChannelT
-     * @template {MirrorChannel} MirrorChannelT
-     * @param {import("./client/Client.js").default<ChannelT, MirrorChannelT>} client
-     * @param {Node} currentNode
-     * @param {AccountId} nodeAccountId
-     * @returns {Promise<void>}
-     */
-    async _handleInvalidNodeAccountId(client, currentNode, nodeAccountId) {
-        this._logger?.debug(
-            `[${this._getLogId()}] node with accountId: ${nodeAccountId.toString()} and proxy IP: ${currentNode.address.toString()} has invalid node account ID, marking as unhealthy and updating network`,
-        );
-
-        // Mark the node as unusable by increasing its backoff and removing it from the healthy nodes list
-        client._network.increaseBackoff(currentNode);
-
-        // Initiate addressbook query and update the client's network
-        // This will make the SDK client have the latest node account IDs for subsequent transactions
-        try {
-            if (client.mirrorNetwork.length > 0) {
-                await client.updateNetwork();
-            } else {
-                this._logger?.warn(
-                    `[${this._getLogId()}] Cannot update address book: no mirror network configured. Retrying with existing network configuration.`,
-                );
-            }
-        } catch (error) {
-            const errorMessage =
-                error instanceof Error ? error.message : String(error);
-            this._logger?.trace(
-                `[${this._getLogId()}] failed to update client address book after INVALID_NODE_ACCOUNT_ID: ${errorMessage}`,
-            );
-        }
-    }
-
-    /**
-     * @private
-     * @param {Channel} channel
-     * @param {RequestT} request
-     * @returns {Promise<ResponseT>}
-     */
-    async _executeRequestWithGrpcDeadline(channel, request) {
-        // Race the execution promise against the grpc timeout to prevent grpc connections
-        // from blocking this request
-        const promises = [];
-        /** @type {ReturnType<typeof setTimeout> | null} */
-        let deadlineTimer = null;
-
-        // If a grpc deadline is set, we should race it, otherwise the only thing in the
-        // list of promises will be the execution promise.
-        if (this._grpcDeadline != null) {
-            promises.push(
-                // eslint-disable-next-line ie11/no-loop-func
-                new Promise((_, reject) => {
-                    deadlineTimer = setTimeout(
-                        // eslint-disable-next-line ie11/no-loop-func
-                        () =>
-                            reject(
-                                new GrpcServiceError(
-                                    GrpcStatus.DeadlineExceeded,
-                                ),
-                            ),
-                        /** @type {number=} */ (this._grpcDeadline),
-                    );
-                }),
-            );
-        }
-
-        this._logger?.trace(
-            `[${this._getLogId()}] sending protobuf ${hex.encode(
-                this._requestToBytes(request),
-            )}`,
-        );
-
-        promises.push(this._execute(channel, request));
-
-        try {
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-return
-            return /** @type {ResponseT} */ (await Promise.race(promises));
-        } finally {
-            if (deadlineTimer != null) {
-                clearTimeout(deadlineTimer);
-            }
-        }
-    }
-
-    /**
      * Execute the request using a client and an optional request timeout
      *
      * @template {Channel} ChannelT
@@ -785,192 +573,21 @@ export default class Executable {
      */
     async execute(client, requestTimeout) {
         await this._setupExecution(client, requestTimeout);
-        const isLocalNode = client.isLocalNetwork;
 
         // Checks if has a valid nodes to which the TX can be sent
         this._validateTransactionNodeIds();
 
-        // Save the start time to be used later with request timeout
-        const requestStartTime = Date.now();
+        const retryExecutor = new RetryExecutor({
+            maxAttempts: /** @type {number} */ (this._maxAttempts),
+            requestTimeout: this._requestTimeout,
+            grpcDeadline: this._grpcDeadline,
+            minBackoff: /** @type {number} */ (this._minBackoff),
+            maxBackoff: this._maxBackoff,
+            logger: this._logger,
+        });
 
-        // Saves each error we get so when we err due to max attempts exceeded we'll have
-        // the last error that was returned by the consensus node
-        let persistentError = null;
-
-        // The retry loop
-        for (
-            let attempt = 1;
-            attempt <= /** @type {number} */ (this._maxAttempts);
-            attempt += 1
-        ) {
-            if (
-                this._requestTimeout != null &&
-                requestStartTime + this._requestTimeout <= Date.now()
-            ) {
-                throw new MaxAttemptsOrTimeoutError(
-                    "timeout exceeded",
-                    this._nodeAccountIds.isEmpty
-                        ? "No node account ID set"
-                        : this._nodeAccountIds.current.toString(),
-                );
-            }
-
-            if (
-                this._shouldSkipAttemptForNodeAccountId(
-                    this._nodeAccountIds.current,
-                )
-            ) {
-                console.error(
-                    `Attempting to execute a transaction against node ${this._nodeAccountIds.current.toString()}, which is not included in the Client's node list. Please review your Client configuration.`,
-                );
-
-                this._nodeAccountIds.advance();
-                continue;
-            }
-
-            const executionNode = this._getExecutionNode(client);
-
-            this._logger?.debug(
-                `[${this._getLogId()}] Node AccountID: ${executionNode.accountId.toString()}, IP: ${executionNode.address.toString()}`,
-            );
-
-            const channel = executionNode.getChannel();
-
-            // Set the gRPC deadline on the channel if this query has a custom deadline
-            if (this._grpcDeadline != null) {
-                channel.setGrpcDeadline(this._grpcDeadline);
-            }
-
-            const request = await this._makeRequestAsync();
-
-            if (!executionNode.isHealthy()) {
-                await this._handleUnhealthyNode(
-                    executionNode,
-                    request,
-                    attempt,
-                    isLocalNode,
-                );
-
-                continue;
-            }
-
-            this._nodeAccountIds.advance();
-
-            let response;
-
-            try {
-                response = await this._executeRequestWithGrpcDeadline(
-                    channel,
-                    request,
-                );
-            } catch (err) {
-                // If we received a grpc status error we need to determine if
-                // we should retry on this error, or err from the request entirely.
-                const error = GrpcServiceError._fromResponse(
-                    /** @type {Error} */ (err),
-                );
-
-                // Save the error in case we retry
-                persistentError = error;
-
-                this._logger?.debug(
-                    `[${this._getLogId()}] received error ${JSON.stringify(
-                        error,
-                    )}`,
-                );
-
-                // If the GRPC or HTTP request level error is retryable, we should retry the request
-                if (this._shouldRetryRequestError(error, attempt)) {
-                    // Increase the backoff for the particular node and remove it from
-                    // the healthy node list
-                    this._logger?.debug(
-                        `[${this._getLogId()}] node with accountId: ${executionNode.accountId.toString()} and proxy IP: ${executionNode.address.toString()} is unhealthy`,
-                    );
-
-                    if (executionNode.isHealthy()) {
-                        client._network.increaseBackoff(executionNode);
-                    }
-                    continue;
-                }
-
-                throw err;
-            }
-
-            this._logger?.trace(
-                `[${this._getLogId()}] sending protobuf ${hex.encode(
-                    this._responseToBytes(response),
-                )}`,
-            );
-
-            // If we didn't receive an error we should decrease the current nodes backoff
-            // in case it is a recovering node
-            client._network.decreaseBackoff(executionNode);
-
-            // Determine what execution state we're in by the response
-            // For transactions this would be as simple as checking the response status is `OK`
-            // while for _most_ queries it would check if the response status is `SUCCESS`
-            // The only odd balls are `TransactionReceiptQuery` and `TransactionRecordQuery`
-            const [status, shouldRetry] = this._getStatusAndExecutionState(
-                request,
-                response,
-            );
-
-            const isError =
-                status.toString() !== Status.Ok.toString() &&
-                status.toString() !== Status.Success.toString();
-
-            if (isError) {
-                persistentError = new Error(status.toString());
-            }
-
-            // Determine by the executing state what we should do
-            switch (shouldRetry) {
-                case ExecutionState.Retry:
-                    if (status === Status.InvalidNodeAccount) {
-                        await this._handleInvalidNodeAccountId(
-                            client,
-                            executionNode,
-                            executionNode.accountId,
-                        );
-                    }
-
-                    await delayForAttempt(
-                        isLocalNode,
-                        attempt,
-                        /** @type {number} */ (this._minBackoff),
-                        this._maxBackoff,
-                    );
-                    continue;
-                case ExecutionState.Finished:
-                    return this._mapResponse(
-                        response,
-                        executionNode.accountId,
-                        request,
-                    );
-                case ExecutionState.Error:
-                    throw this._mapStatusError(
-                        request,
-                        response,
-                        executionNode.accountId,
-                    );
-                default:
-                    throw new Error(
-                        "(BUG) non-exhaustive switch statement for `ExecutionState`",
-                    );
-            }
-        }
-
-        // We'll only get here if we've run out of attempts, so we return an error wrapping the
-        // persistent error we saved before.
-
-        throw new MaxAttemptsOrTimeoutError(
-            `max attempts of ${
-                /** @type {number} */ (this._maxAttempts).toString()
-            } was reached for request with last error being: ${
-                persistentError != null ? persistentError.toString() : ""
-            }`,
-            this._nodeAccountIds.current.toString(),
-        );
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-return
+        return retryExecutor.execute(this, client);
     }
 
     /**
@@ -1004,43 +621,4 @@ export default class Executable {
     get logger() {
         return this._logger;
     }
-}
-
-/**
- * Checks if the request is a transaction receipt or record request
- *
- * @template T
- * @param {T} request - The request to check
- * @returns {boolean} - True if the request is a transaction receipt or record
- */
-function isTransactionReceiptOrRecordRequest(request) {
-    if (typeof request !== "object" || request === null) {
-        return false;
-    }
-
-    return (
-        "transactionGetReceipt" in request || "transactionGetRecord" in request
-    );
-}
-
-/**
- * A simple function that returns a promise timeout for a specific period of time
- *
- * @param {boolean} isLocalNode
- * @param {number} attempt
- * @param {number} minBackoff
- * @param {number} maxBackoff
- * @returns {Promise<void>}
- */
-function delayForAttempt(isLocalNode, attempt, minBackoff, maxBackoff) {
-    if (isLocalNode) {
-        return new Promise((resolve) => setTimeout(resolve, minBackoff));
-    }
-
-    // 0.1s, 0.2s, 0.4s, 0.8s, ...
-    const ms = Math.min(
-        Math.floor(minBackoff * Math.pow(2, attempt)),
-        maxBackoff,
-    );
-    return new Promise((resolve) => setTimeout(resolve, ms));
 }

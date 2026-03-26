@@ -1,10 +1,5 @@
-/* global globalThis */
-
-import { vi } from "vitest";
 import Executable, { RST_STREAM } from "../../src/Executable.js";
 import AccountId from "../../src/account/AccountId.js";
-import GrpcServiceError from "../../src/grpc/GrpcServiceError.js";
-import GrpcStatus from "../../src/grpc/GrpcStatus.js";
 
 describe("Executable", function () {
     it("RST_STREAM regex matches actual response returned", function () {
@@ -59,58 +54,7 @@ describe("Executable", function () {
         expect(beforeExecuteCalled).to.be.true;
     });
 
-    it("_throwIfRequestTimedOut throws with the current node account ID", function () {
-        const executable = new Executable();
-
-        executable._requestTimeout = 1;
-        executable._nodeAccountIds.setList([new AccountId(3)]);
-
-        try {
-            executable._throwIfRequestTimedOut(Date.now() - 2);
-            expect.fail("Expected request timeout error");
-        } catch (error) {
-            expect(error.message).to.equal("timeout exceeded");
-            expect(error.nodeAccountId).to.equal("0.0.3");
-        }
-    });
-
-    it("_getExecutionNode returns the network node and seeds nodeAccountIds when empty", function () {
-        const executable = new Executable();
-        const currentNode = { accountId: new AccountId(3) };
-
-        const result = executable._getExecutionNode({
-            _network: {
-                getNode() {
-                    return currentNode;
-                },
-            },
-        });
-
-        expect(result).to.equal(currentNode);
-        expect(executable._nodeAccountIds.current.toString()).to.equal("0.0.3");
-    });
-
-    it("_getExecutionNode returns the resolved network node when nodeAccountIds are already set", function () {
-        const executable = new Executable();
-        const currentNode = { accountId: new AccountId(3) };
-
-        executable._nodeAccountIds.setList([new AccountId(111)]);
-
-        const result = executable._getExecutionNode({
-            _network: {
-                getNode() {
-                    return currentNode;
-                },
-            },
-        });
-
-        expect(result).to.equal(currentNode);
-        expect(executable._nodeAccountIds.current.toString()).to.equal(
-            "0.0.111",
-        );
-    });
-
-    it("_shouldSkipAttemptForNodeAccountId advances when the node is not in transactionNodeIds", function () {
+    it("_shouldSkipAttemptForNodeAccountId returns true when the node is not in transactionNodeIds", function () {
         const executable = new Executable();
 
         executable._nodeAccountIds.setList([
@@ -119,130 +63,23 @@ describe("Executable", function () {
         ]);
         executable.transactionNodeIds = ["0.0.111"];
 
-        const originalError = console.error;
-        console.error = () => {};
-
-        try {
-            const shouldSkip = executable._shouldSkipAttemptForNodeAccountId(
-                new AccountId(3),
-            );
-
-            expect(shouldSkip).to.be.true;
-            expect(executable._nodeAccountIds.current.toString()).to.equal(
-                "0.0.4",
-            );
-        } finally {
-            console.error = originalError;
-        }
-    });
-
-    it("_handleUnhealthyNode advances to the next node when failover is possible", async function () {
-        const executable = new Executable();
-        const debug = vi.fn();
-
-        executable._nodeAccountIds.setList([
-            new AccountId(3),
-            new AccountId(4),
-        ]);
-        executable._logger = { debug };
-        executable._getLogId = () => "debug.log";
-
-        await executable._handleUnhealthyNode(
-            { isHealthy: () => false },
-            {},
-            1,
-            false,
-        );
-
-        expect(executable._nodeAccountIds.current.toString()).to.equal("0.0.4");
-        expect(debug).toHaveBeenCalledWith(
-            "[debug.log] Node is not healthy, trying the next node.",
-        );
-    });
-
-    it("_handleInvalidNodeAccountId marks the node unusable and warns when no mirror network is configured", async function () {
-        const executable = new Executable();
-        const debug = vi.fn();
-        const increaseBackoff = vi.fn();
-        const warn = vi.fn();
-        const trace = vi.fn();
-        const updateNetwork = vi.fn();
-        const currentNode = {
-            address: { toString: () => "127.0.0.1:50211" },
-        };
-
-        executable._logger = { debug, warn, trace };
-        executable._getLogId = () => "logger.id";
-
-        await executable._handleInvalidNodeAccountId(
-            {
-                _network: { increaseBackoff },
-                mirrorNetwork: [],
-                updateNetwork,
-            },
-            currentNode,
+        const shouldSkip = executable._shouldSkipAttemptForNodeAccountId(
             new AccountId(3),
         );
 
-        expect(increaseBackoff).toHaveBeenCalledWith(currentNode);
-        expect(updateNetwork).not.toHaveBeenCalled();
-        expect(warn).toHaveBeenCalledWith(
-            "[logger.id] Cannot update address book: no mirror network configured. Retrying with existing network configuration.",
+        expect(shouldSkip).to.be.true;
+    });
+
+    it("_shouldSkipAttemptForNodeAccountId returns false when the node is in transactionNodeIds", function () {
+        const executable = new Executable();
+
+        executable._nodeAccountIds.setList([new AccountId(3)]);
+        executable.transactionNodeIds = ["0.0.3"];
+
+        const shouldSkip = executable._shouldSkipAttemptForNodeAccountId(
+            new AccountId(3),
         );
-    });
 
-    it("_shouldRetryRequestError is driven by retryable error type and attempt count", function () {
-        const executable = new Executable();
-        const error = new GrpcServiceError(GrpcStatus.Unavailable);
-
-        executable._maxAttempts = 3;
-
-        expect(executable._shouldRetryRequestError(error, 1)).to.be.true;
-        expect(executable._shouldRetryRequestError(error, 4)).to.be.false;
-        expect(executable._shouldRetryRequestError(new Error("nope"), 1)).to.be
-            .false;
-    });
-
-    it("_executeRequestWithGrpcDeadline returns the execution response and clears the deadline timer", async function () {
-        const executable = new Executable();
-        const trace = vi.fn();
-        const response = { ok: true };
-        const deadlineTimer = { id: "deadline" };
-        const setTimeoutSpy = vi
-            .spyOn(globalThis, "setTimeout")
-            .mockImplementation(() => deadlineTimer);
-        const clearTimeoutSpy = vi
-            .spyOn(globalThis, "clearTimeout")
-            .mockImplementation(() => {});
-
-        executable._logger = {
-            trace,
-            debug() {},
-            info() {},
-            warn() {},
-            error() {},
-            fatal() {},
-        };
-        executable._grpcDeadline = 1000;
-        executable._getLogId = () => "trace.log";
-        executable._requestToBytes = () => new Uint8Array([1, 2, 3]);
-        executable._execute = vi.fn().mockResolvedValue(response);
-
-        try {
-            const result = await executable._executeRequestWithGrpcDeadline(
-                {},
-                { request: true },
-            );
-
-            expect(result).to.equal(response);
-            expect(trace).toHaveBeenCalledWith(
-                "[trace.log] sending protobuf 010203",
-            );
-            expect(setTimeoutSpy).toHaveBeenCalledOnce();
-            expect(clearTimeoutSpy).toHaveBeenCalledWith(deadlineTimer);
-        } finally {
-            setTimeoutSpy.mockRestore();
-            clearTimeoutSpy.mockRestore();
-        }
+        expect(shouldSkip).to.be.false;
     });
 });
